@@ -1,34 +1,133 @@
-use std::io::{Result as IoResult};
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::path::Path;
 
-struct Capability {
-    code: Code,
-    name: String,
-    description: String,
+pub trait CapabilityResult {}
+
+impl CapabilityResult for bool {}
+impl CapabilityResult for i32 {}
+impl CapabilityResult for String {}
+
+pub trait Capability {
+    type Result: CapabilityResult;
+
+    fn code(&self) -> Code;
+    fn name(&self) -> String;
+    fn description(&self) -> String;
 }
 
-struct Termcap {}
+/// The core interface for querying the system's termcap database for capabilities of a terminal.
+pub struct Termcap {
+    database: Database,
+}
 
 impl Termcap {
+    /// Loads the system termcap database.
+    pub fn load() -> IoResult<Termcap> {
+        /// Possible paths to the termcap file
+        const TERMCAP_PATHS: &[&str] = &["/usr/share/misc/termcap", "/etc/termcap"];
+
+        let path = TERMCAP_PATHS
+            .iter()
+            .find(|path| Path::new(path).is_file())
+            .ok_or(Error::from(ErrorKind::NotFound))?;
+
+        Ok(Self {
+            database: Database::load(Path::new(path))?,
+        })
+    }
+
+    /// Loads the specified termcap file.
+    pub fn load_from_path(path: &Path) -> IoResult<Termcap> {
+        Ok(Self {
+            database: Database::load(path)?,
+        })
+    }
+
     /// Gets the matching termcap(5) entry for the current value of `$TERM`.
     ///
     /// Returns `None` if `$TERM` is not set or if there is no entry in the termcap database for the
     /// current `$TERM` value. See [get()](Self::get()) to look up by terminal name without relying
     /// on the presence of any particular environment value.
-    pub fn get_env() -> Option<&'static [Entry]> {
+    pub fn get_env<'a>(&'a self) -> Option<Capabilities<'a>> {
+        // Terminal names can only be ASCII, so we can jump to NotFound if $TERM is non-ASCII.
         let term = std::env::var("TERM").ok()?;
-        Self::get(&term);
-        todo!();
+
+        Some(Capabilities {
+            database: &self.database,
+            entries: self.database.lookup(&term)?,
+        })
     }
 
     /// Gets the matching `termcap(5)` entry for the terminal with a name or code matching `term`.
     ///
     /// Returns `None` if there is no match for this terminal name/code in the termcap(5) database
     /// or if the termcap database could not be found.
-    pub fn get(term: &str) -> Option<&[Entry]> {
-        let database = Database::load().ok()?;
-        database.lookup(term);
+    pub fn get<'a>(&'a self, term: &str) -> Option<Capabilities<'a>> {
+        Some(Capabilities {
+            database: &self.database,
+            entries: self.database.lookup(term)?,
+        })
+    }
+}
+
+/// Represents the capabilities of a particular terminal, as loaded from the termcap database.
+///
+/// Can be used to iterate over all capabilities or to query for a specific capability.
+pub struct Capabilities<'a> {
+    /// The loaded termcap database.
+    database: &'a Database,
+    /// The entries returned by [`Database::lookup()`].
+    entries: &'a [Entry],
+}
+
+impl Capabilities<'_> {
+    /// Queries for the presence and value of a named capability `capability`.
+    pub fn query<C: Capability>(&self, capability: C) -> Option<C::Result> {
+        for cap in self.entries {
+            if cap.code == capability.code() {
+                // Check for explicitly disavowed capabilities
+                if matches!(cap.value, Field::Bool(false)) {
+                    return None;
+                }
+            }
+        }
+
         todo!()
+    }
+
+    #[allow(unused)]
+    /// Returns an iterator of all capabilities matching the looked up terminal.
+    fn iter<'a>(&'a self) -> CapabilitiesIterator<'a> {
+        CapabilitiesIterator {
+            database: self.database,
+            entries: self.entries.iter(),
+        }
+    }
+}
+
+/// Iterates over the capabilities of a terminal, as recorded in the termcap database.
+struct CapabilitiesIterator<'a> {
+    database: &'a Database,
+    entries: std::slice::Iter<'a, Entry>,
+}
+
+impl<'a> Iterator for CapabilitiesIterator<'a> {
+    type Item = &'a Entry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.entries.next()?;
+        if entry.code == Code::new([b't', b'c']) {
+            // Inherits from another entry
+            let parent_term = match &entry.value {
+                Field::String(term) => term,
+                _ => unreachable!(),
+            };
+            let entries = self.database.lookup(&parent_term)?;
+            self.entries = entries.into_iter();
+            self.next()
+        } else {
+            Some(entry)
+        }
     }
 }
 
@@ -87,7 +186,7 @@ impl std::fmt::Display for Entry {
 
 /// The two-character code associated with the capability.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Code([u8; 2]);
+pub struct Code([u8; 2]);
 
 impl Code {
     fn new(code: [u8; 2]) -> Self {
@@ -133,16 +232,10 @@ impl Database {
         }
     }
 
-    pub fn load() -> IoResult<Database> {
-        use std::io::{Error, ErrorKind};
-
-        /// Possible paths to the termcap file
-        const TERMCAP_PATHS: &[&str] = &["/usr/share/misc/termcap", "/etc/termcap"];
-
-        let path = TERMCAP_PATHS
-            .iter()
-            .find(|path| Path::new(path).is_file())
-            .ok_or(Error::from(ErrorKind::NotFound))?;
+    pub fn load(path: &Path) -> IoResult<Database> {
+        if !path.exists() {
+            return Err(Error::from(ErrorKind::NotFound));
+        }
 
         Database::parse(Path::new(path))
     }
@@ -199,107 +292,103 @@ impl Database {
                 continue;
             }
 
-            if line.contains("xterm-256color") {
-                dbg!(line);
-            }
-
             // dbg!(line);
             let (ids, caps) = line.split_once(':').unwrap();
             // dbg!(ids);
 
-                // Parse line as a terminal identifier.
-                // Format should be `name1|name2|..|long name maybe w/ spaces :\`
-                let mut names = ids.split('|').map(str::trim_end).map(str::to_string);
-                term_id = Some(TermId {
-                    key: names.next().unwrap(), // first value is always available
-                    aliases: names.collect(),
-                });
-                // dbg!(&term_id.as_ref().unwrap().key);
+            // Parse line as a terminal identifier.
+            // Format should be `name1|name2|..|long name maybe w/ spaces :\`
+            let mut names = ids.split('|').map(str::trim_end).map(str::to_string);
+            term_id = Some(TermId {
+                key: names.next().unwrap(), // first value is always available
+                aliases: names.collect(),
+            });
+            // dbg!(&term_id.as_ref().unwrap().key);
 
-                // Capabilities are one or more per line, starting with :, separated by ':', and
-                // continuing on the next line with \ ending when the line ends with : without a
-                // new line escape \.
+            // Capabilities are one or more per line, starting with :, separated by ':', and
+            // continuing on the next line with \ ending when the line ends with : without a
+            // new line escape \.
 
-                // Capabilities are separated by : but we can't just call line.split(':') because a
-                // : can be part of a capability's string payload. We use a custom iterator to
-                // return capabilties that splits on : but not escaped colons (denoted as \:).
-                let mut remainder = caps.trim_matches(':').chars().peekable();
-                let mut cap = String::new();
-                let caps_fn = || -> Option<_> {
-                    cap.clear();
-                    loop {
-                        match remainder.next() {
-                            None | Some(':') if cap.trim().is_empty() => return None,
-                            None | Some(':') => return Some(cap.clone()),
-                            Some('^') => {
-                                // Handle control code
-                                let next = remainder.next().unwrap();
-                                cap.push(char::from(next as u8 ^ 0x40));
-                            }
-                            Some('\\') => {
-                                // Handle escape
-                                match remainder.next() {
-                                    Some('\\') => cap.push('\\'),
-                                    Some('E' ) => cap.push('\x1B'), // escape
-                                    Some('e' ) => cap.push('\x1B'), // escape typo (bitgraph on BSD)
-                                    Some('n') => cap.push('\n'),
-                                    Some('t') => cap.push('\t'),
-                                    Some('r') => cap.push('\r'),
-                                    Some('b') => cap.push('\x08'), // backspace
-                                    Some('^') => cap.push('^'),
-                                    Some('f') => cap.push('\x0C'), // form feed
-                                    Some(':') => cap.push(':'),
-                                    Some(d0 @ '0'..='7') => {
-                                        // Octal number. These are supposed to be three octal digits
-                                        // long, but it seems it's "up to" three digits in practice.
-                                        let mut oct = [d0 as u8, b'\0', b'\0'];
-                                        let oct = if matches!(remainder.peek(), Some('0'..='7')) {
-                                            oct[1] = remainder.next().unwrap() as u8;
-                                            if matches!(remainder.peek(), Some('0'..='7')) {
-                                                oct[2] = remainder.next().unwrap() as u8;
-                                                &oct[..3]
-                                            } else {
-                                                &oct[..2]
-                                            }
+            // Capabilities are separated by : but we can't just call line.split(':') because a
+            // : can be part of a capability's string payload. We use a custom iterator to
+            // return capabilties that splits on : but not escaped colons (denoted as \:).
+            let mut remainder = caps.trim_matches(':').chars().peekable();
+            let mut cap = String::new();
+            let caps_fn = || -> Option<_> {
+                cap.clear();
+                loop {
+                    match remainder.next() {
+                        None | Some(':') if cap.trim().is_empty() => return None,
+                        None | Some(':') => return Some(cap.clone()),
+                        Some('^') => {
+                            // Handle control code
+                            let next = remainder.next().unwrap();
+                            cap.push(char::from(next as u8 ^ 0x40));
+                        }
+                        Some('\\') => {
+                            // Handle escape
+                            match remainder.next() {
+                                Some('\\') => cap.push('\\'),
+                                Some('E') => cap.push('\x1B'), // escape
+                                Some('e') => cap.push('\x1B'), // escape typo (bitgraph on BSD)
+                                Some('n') => cap.push('\n'),
+                                Some('t') => cap.push('\t'),
+                                Some('r') => cap.push('\r'),
+                                Some('b') => cap.push('\x08'), // backspace
+                                Some('^') => cap.push('^'),
+                                Some('f') => cap.push('\x0C'), // form feed
+                                Some(':') => cap.push(':'),
+                                Some(d0 @ '0'..='7') => {
+                                    // Octal number. These are supposed to be three octal digits
+                                    // long, but it seems it's "up to" three digits in practice.
+                                    let mut oct = [d0 as u8, b'\0', b'\0'];
+                                    let oct = if matches!(remainder.peek(), Some('0'..='7')) {
+                                        oct[1] = remainder.next().unwrap() as u8;
+                                        if matches!(remainder.peek(), Some('0'..='7')) {
+                                            oct[2] = remainder.next().unwrap() as u8;
+                                            &oct[..3]
                                         } else {
-                                            &oct[..1]
-                                        };
-                                        let oct = std::str::from_utf8(oct).unwrap();
-                                        let byte = u8::from_str_radix(oct, 8).unwrap();
-                                        cap.push(char::from(byte));
-                                    }
-                                    c @ _ => {
-                                        // unreachable!("\\{:?} on {}", c, caps),
-                                        // Typos abound in termcap files.
-                                        // e.g. there's \LM1 \LM2 in 4112 under BSD, which should be
-                                        // \ELM1\ELM2 judging by context.
-                                        eprintln!("\\{:?} on {}", c, caps);
-                                    }
+                                            &oct[..2]
+                                        }
+                                    } else {
+                                        &oct[..1]
+                                    };
+                                    let oct = std::str::from_utf8(oct).unwrap();
+                                    let byte = u8::from_str_radix(oct, 8).unwrap();
+                                    cap.push(char::from(byte));
+                                }
+                                c @ _ => {
+                                    // unreachable!("\\{:?} on {}", c, caps),
+                                    // Typos abound in termcap files.
+                                    // e.g. there's \LM1 \LM2 in 4112 under BSD, which should be
+                                    // \ELM1\ELM2 judging by context.
+                                    eprintln!("\\{:?} on {}", c, caps);
                                 }
                             }
-                            Some(c) => cap.push(c),
                         }
+                        Some(c) => cap.push(c),
                     }
-                };
+                }
+            };
 
-                let mut caps = std::iter::from_fn(caps_fn);
-                while let Some(cap) = caps.next() {
-                    if cap.is_empty()
+            let mut caps = std::iter::from_fn(caps_fn);
+            while let Some(cap) = caps.next() {
+                if cap.is_empty()
                         // The (boolean?) capability is "commented out" and should be skipped
                         || cap.starts_with('.')
-                    {
-                        continue;
-                    }
+                {
+                    continue;
+                }
 
-                    if cap.as_bytes().len() < 2 {
-                        // adm20 entry in FreeBSD termcap has a flag with the literal code ^X which
-                        // we unescape to a single byte above. The original entry is obviously
-                        // invalid, no such flag exists.
-                        eprintln!("Unsupported termcap entry: {} on {}", cap, line);
-                        continue;
-                    }
-                    let code = Code::new(cap.as_bytes()[0..2].try_into().unwrap());
-                    let value =
+                if cap.as_bytes().len() < 2 {
+                    // adm20 entry in FreeBSD termcap has a flag with the literal code ^X which
+                    // we unescape to a single byte above. The original entry is obviously
+                    // invalid, no such flag exists.
+                    eprintln!("Unsupported termcap entry: {} on {}", cap, line);
+                    continue;
+                }
+                let code = Code::new(cap.as_bytes()[0..2].try_into().unwrap());
+                let value =
                         // Boolean fields are denoted only by the presence of their code, e.g. :xn:
                         if cap.len() == 2 {
                             // Boolean capability, always true by value of its mere presence
@@ -340,9 +429,9 @@ impl Database {
                             continue;
                         };
 
-                    capabilities.push(Entry { code, value });
-                }
-                insert_entry!();
+                capabilities.push(Entry { code, value });
+            }
+            insert_entry!();
         }
 
         database
@@ -354,13 +443,25 @@ impl Database {
 
 #[test]
 fn db_load() -> std::io::Result<()> {
-    let db = Database::load()?;
+    let db = Termcap::load()?.database;
     let entries = db
         .lookup(&std::env::var("TERM").unwrap())
         .ok_or(std::io::Error::from(std::io::ErrorKind::NotFound))?;
 
     for entry in entries {
         eprintln!("{}", entry);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn caps_dump() -> std::io::Result<()> {
+    let termcap = Termcap::load()?;
+    let caps = termcap.get_env().ok_or(Error::from(ErrorKind::NotFound))?;
+
+    for cap in caps.iter() {
+        eprintln!("{}", cap);
     }
 
     Ok(())
