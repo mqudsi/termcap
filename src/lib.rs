@@ -84,15 +84,33 @@ impl Capabilities<'_> {
     /// Queries for the presence and value of a named capability `capability`.
     pub fn query<C: Capability>(&self, capability: C) -> Option<C::Result> {
         for cap in self.entries {
+            // We could replace the duplication of the tc handling here and in the
+            // CapabilitiesIterator below by looping over iterated capabilities instead of looping
+            // over the raw entries directly, but the CapabilitiesIterator needs to record disavowed
+            // entries as it encounters them so it has the extra overhead of a HashSet which we
+            // don't need here (since we return None when we come across a disavowed capability).
+            if cap.code == Code::new([b't', b'c']) {
+                // We need to continue search in the parent's capability list
+                let parent_term = match &cap.value {
+                    Field::String(term) => term.as_str(),
+                    _ => unreachable!(),
+                };
+                let parent_caps = Capabilities {
+                    database: self.database,
+                    entries: self.database.lookup(parent_term)?,
+                };
+                return parent_caps.query(capability);
+            }
             if cap.code == capability.code() {
                 // Check for explicitly disavowed capabilities
                 if matches!(cap.value, Field::Bool(false)) {
                     return None;
                 }
+                todo!();
             }
         }
 
-        todo!()
+        None
     }
 
     #[allow(unused)]
@@ -101,6 +119,7 @@ impl Capabilities<'_> {
         CapabilitiesIterator {
             database: self.database,
             entries: self.entries.iter(),
+            disavowed: Default::default(),
         }
     }
 }
@@ -109,6 +128,7 @@ impl Capabilities<'_> {
 struct CapabilitiesIterator<'a> {
     database: &'a Database,
     entries: std::slice::Iter<'a, Entry>,
+    disavowed: std::collections::HashSet<Code>,
 }
 
 impl<'a> Iterator for CapabilitiesIterator<'a> {
@@ -116,13 +136,23 @@ impl<'a> Iterator for CapabilitiesIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.entries.next()?;
-        if entry.code == Code::new([b't', b'c']) {
-            // Inherits from another entry
+        if matches!(entry.value, Field::Bool(false)) {
+            // This capability is specifically disavowed.
+            // Record that so we don't return it when enumerating the parent term's capabilities.
+            self.disavowed.insert(entry.code);
+            self.next()
+        } else if self.disavowed.contains(&entry.code) {
+            // This parent entry was disavowed by the child.
+            // Skip it and move on to the next.
+            self.next()
+        } else if entry.code == Code::new([b't', b'c']) {
+            // Inherits from another entry. This is always the last entry in each term's list, so we
+            // can replace self.entries with the parent's and continue.
             let parent_term = match &entry.value {
-                Field::String(term) => term,
+                Field::String(term) => term.as_str(),
                 _ => unreachable!(),
             };
-            let entries = self.database.lookup(&parent_term)?;
+            let entries = self.database.lookup(parent_term)?;
             self.entries = entries.into_iter();
             self.next()
         } else {
@@ -185,7 +215,7 @@ impl std::fmt::Display for Entry {
 }
 
 /// The two-character code associated with the capability.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Code([u8; 2]);
 
 impl Code {
